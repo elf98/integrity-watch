@@ -1,0 +1,166 @@
+#!/bin/bash
+# integrity-watch: a simple intrusion watch for Debian/Ubuntu servers.
+#
+# Takes a snapshot of what attackers usually change (system services, cron, accounts,
+# suid files, listening ports, ssh keys, modified package files, executables in temp
+# directories) and compares it with a baseline taken while the server was known clean.
+#
+#   integrity-watch baseline            # take a (new) baseline after deliberate changes
+#   integrity-watch check               # snapshot the current state and compare
+#   integrity-watch check --mail addr   # as above, email on CRIT (needs a working `mail`)
+#   integrity-watch collect             # snapshot only, no comparison
+#
+# Exit code (Nagios compatible): 0 = OK, 1 = WARN, 2 = CRIT, 3 = UNKNOWN.
+# Run as root. License: MIT, see LICENSE.
+
+set -u
+STATE_DIR="${INTEGRITY_WATCH_DIR:-/var/lib/integrity-watch}"
+CURRENT="$STATE_DIR/current.txt"
+BASELINE="$STATE_DIR/baseline.txt"
+# Package files allowed to differ in dpkg -V without alerting (regex). Add your own if needed.
+DPKG_IGNORE="${INTEGRITY_WATCH_DPKG_IGNORE:-^/usr/share/(doc|man|info|locale)/|^/usr/share/php/[.](channels|registry)/}"
+
+die() { echo "integrity-watch: $*" >&2; exit 3; }
+[ "$(id -u)" = 0 ] || die "must be run as root"
+command -v dpkg >/dev/null || die "requires dpkg (Debian/Ubuntu)"
+
+section() { echo "## $1"; }
+
+collect() {
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  local tmp="$STATE_DIR/current.tmp"
+  {
+    echo "# generated $(date -Is) host=$(hostname)"
+
+    # Package files whose content no longer matches the package checksum (config files excluded).
+    # Changes on tampering, not on regular updates.
+    section dpkg
+    dpkg -V 2>/dev/null | grep -E '^..5' | grep -vE '^.{9} c ' | awk '{print $NF}' \
+      | grep -vE "$DPKG_IGNORE" | sort -u
+
+    # Enabled systemd units, and unit files not owned by any package.
+    section units
+    systemctl list-unit-files --state=enabled --no-legend --plain 2>/dev/null | awk '{print "enabled " $1}' | sort
+    for f in /etc/systemd/system/*.service /etc/systemd/system/*.timer /etc/systemd/system/*.socket \
+             /usr/lib/systemd/system/*.service /usr/local/lib/systemd/system/* \
+             /root/.config/systemd/user/* /home/*/.config/systemd/user/*; do
+      [ -f "$f" ] || continue
+      [ -L "$f" ] && continue
+      dpkg -S "$f" >/dev/null 2>&1 && continue
+      echo "unpackaged $f $(md5sum < "$f" | cut -c1-12)"
+    done | sort
+
+    # Cron: one hash per source. "pkg" = owned by a package (may change on updates), "local" = your own.
+    section cron
+    for f in /etc/crontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* /etc/anacrontab; do
+      [ -f "$f" ] || continue
+      if dpkg -S "$f" >/dev/null 2>&1; then kind=pkg; else kind=local; fi
+      echo "$kind $f $(grep -vE '^\s*(#|$)' "$f" | md5sum | cut -c1-12)"
+    done | sort
+    for f in /var/spool/cron/crontabs/*; do
+      [ -f "$f" ] || continue
+      echo "user:$(basename "$f") $(grep -vE '^\s*(#|$)' "$f" | md5sum | cut -c1-12)"
+    done | sort
+    systemctl list-timers --all --no-legend --plain 2>/dev/null | awk '{print "timer " $NF}' | grep -v '^timer $' | sort -u
+
+    # Accounts that can log in (have a real shell).
+    section shells
+    awk -F: '$7 !~ /(nologin|false|sync|halt|shutdown)$/ {print $1 " " $7}' /etc/passwd | sort
+
+    # setuid/setgid files.
+    section suid
+    find / -xdev -type f \( -perm -4000 -o -perm -2000 \) -printf '%p %m %u:%g\n' 2>/dev/null | sort
+
+    # Listening ports and the program behind each.
+    section listen
+    ss -tulnpH 2>/dev/null | awk '{proc=""; if (match($0,/users:\(\("[^"]+"/)) {proc=substr($0,RSTART+9,RLENGTH-10)} print $1, $5, proc}' | sort -u
+
+    # authorized_keys: hash and number of keys per file.
+    section sshkeys
+    for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys /etc/ssh/authorized_keys/*; do
+      [ -f "$f" ] || continue
+      echo "$f $(grep -vE '^\s*(#|$)' "$f" | sort | md5sum | cut -c1-12) $(grep -cvE '^\s*(#|$)' "$f")"
+    done | sort
+
+    # Executable files in temp directories (a common hiding place for miners and backdoors).
+    section tmpexec
+    find /tmp /var/tmp /dev/shm -xdev -type f -perm /111 -printf '%p %u %s\n' 2>/dev/null | sort
+
+    # Processes whose binary has been deleted or lives in a temp directory.
+    section procs
+    for p in /proc/[0-9]*; do
+      exe=$(readlink "$p/exe" 2>/dev/null) || continue
+      case "$exe" in
+        *"(deleted)"*|/tmp/*|/var/tmp/*|/dev/shm/*|/run/user/*)
+          echo "$(basename "$p") $(tr '\0' ' ' < "$p/cmdline" 2>/dev/null | cut -c1-80) exe=$exe" ;;
+      esac
+    done | sort
+  } > "$tmp" 2>/dev/null
+  mv -f "$tmp" "$CURRENT"; chmod 600 "$CURRENT"
+}
+
+# Lines of one section in a snapshot file.
+lines() { awk -v s="## $2" '$0==s{f=1;next} /^## /{f=0} f && !/^#/' "$1"; }
+
+check() {
+  [ -s "$BASELINE" ] || { echo "UNKNOWN: no baseline. Run: integrity-watch baseline"; return 3; }
+  local status=0 report=""
+  add() { report+="$1"$'\n'; }
+  raise() { [ "$1" -gt "$status" ] && status=$1; }
+
+  # Sections where every line is a finding in itself.
+  for sec in dpkg tmpexec procs; do
+    local found; found=$(lines "$CURRENT" "$sec")
+    if [ -n "$found" ]; then
+      raise 2; add "CRIT  $sec: $(echo "$found" | wc -l) finding(s)"
+      add "$(echo "$found" | head -15 | sed 's/^/        /')"
+    else
+      add "OK    $sec"
+    fi
+  done
+
+  # Sections compared with the baseline: added = CRIT, removed = WARN.
+  # A changed package-owned cron file (pkg line) = WARN, since package updates do that.
+  for sec in units cron shells suid listen sshkeys; do
+    local added removed crit_added
+    added=$(comm -13 <(lines "$BASELINE" "$sec" | sort) <(lines "$CURRENT" "$sec" | sort))
+    removed=$(comm -23 <(lines "$BASELINE" "$sec" | sort) <(lines "$CURRENT" "$sec" | sort))
+    crit_added=$(echo "$added" | grep -v '^pkg ' | grep -v '^$' || true)
+    if [ -n "$crit_added" ]; then
+      raise 2; add "CRIT  $sec: +$(echo "$added" | grep -c .) / -$(echo "$removed" | grep -c .) vs baseline"
+    elif [ -n "$added$removed" ]; then
+      raise 1; add "WARN  $sec: +$(echo "$added" | grep -c .) / -$(echo "$removed" | grep -c .) vs baseline"
+    else
+      add "OK    $sec"; continue
+    fi
+    [ -n "$added" ]   && add "$(echo "$added"   | head -10 | sed 's/^/      + /')"
+    [ -n "$removed" ] && add "$(echo "$removed" | head -10 | sed 's/^/      - /')"
+  done
+
+  local label=(OK WARN CRIT UNKNOWN)
+  echo "integrity-watch ${label[$status]} on $(hostname) $(date '+%F %T')"
+  echo "baseline: $(head -1 "$BASELINE" | sed 's/^# generated //')"
+  printf '%s' "$report"
+  return $status
+}
+
+cmd="${1:-check}"; shift || true
+case "$cmd" in
+  collect)  collect; echo "snapshot saved: $CURRENT" ;;
+  baseline) collect; cp -f "$CURRENT" "$BASELINE"; chmod 600 "$BASELINE"
+            echo "baseline saved: $BASELINE ($(grep -vc '^#' "$BASELINE") lines)" ;;
+  check)
+    mailto=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --mail) mailto="${2:-}"; shift 2 ;; *) die "unknown option: $1" ;; esac
+    done
+    collect
+    out=$(check); rc=$?
+    echo "$out"
+    if [ -n "$mailto" ] && [ $rc -ge 2 ]; then
+      echo "$out" | mail -s "integrity-watch: deviation on $(hostname)" "$mailto"
+    fi
+    exit $rc ;;
+  -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $cmd (collect | baseline | check)" ;;
+esac
