@@ -6,10 +6,13 @@ It takes a snapshot of the things attackers usually change and compares it with 
 took while the server was known to be clean. If anything deviates, you find out, ideally the same
 day rather than months later.
 
-The script was written after an intrusion on temperatur.nu in the autumn of 2026. The attacker
-stayed for almost three months, with a backdoor disguised as a system service, a scheduled job
-under the web server's account, a replaced system file and a crypto miner in a temp directory.
-This check would have flagged every one of those within an hour.
+The script was written after an intrusion on temperatur.nu in 2026. In July an automated attack
+got in through a forgotten upload script, gained root and installed a backdoor disguised as a
+system service, along with a replaced system file. Then nothing happened for almost three months.
+In October the attacker returned through the same backdoor, added a scheduled job under the web
+server's account and started a crypto miner from a temp directory, and the load alarm finally
+gave it away. This check would have flagged the backdoor within an hour of it being installed in
+July.
 
 ## What it watches
 
